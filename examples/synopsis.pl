@@ -15,6 +15,7 @@
   sub _start {
     POE::Component::MetaCPAN::Recent->spawn(
         event => 'upload',
+        delay => 60,
     );
     return;
   }

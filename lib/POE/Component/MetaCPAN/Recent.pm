@@ -5,7 +5,8 @@ package POE::Component::MetaCPAN::Recent;
 use strict;
 use warnings;
 use Carp;
-use POE qw[Component::Client::HTTP];
+use POE qw[Component::SmokeBox::Recent::HTTP];
+use URI;
 use HTTP::Request;
 use HTTP::Response;
 use JSON::PP;
@@ -21,8 +22,13 @@ sub spawn {
   my $self = bless \%opts, $package;
   $self->{session_id} = POE::Session->create(
     object_states => [
-      $self => { shutdown => '_shutdown', },
-      $self => [ qw(_start _get_recent _handle_recent _real_shutdown) ],
+      $self => {
+        shutdown      => '_shutdown',
+        http_sockerr  => '_get_connect_error',
+        http_timeout  => '_get_connect_error',
+        http_response => '_handle_recent',
+      },
+      $self => [ qw(_start _get_recent _real_shutdown) ],
     ],
     heap => $self,
     ( ref($options) eq 'HASH' ? ( options => $options ) : () ),
@@ -52,9 +58,7 @@ sub _real_shutdown {
   my ($kernel,$self) = @_[KERNEL,OBJECT];
   $kernel->alarm_remove_all();
   $kernel->alias_remove( $_ ) for $kernel->alias_list();
-  $kernel->refcount_decrement( $self->{session_id}, __PACKAGE__ ) unless $self->{alias};
   $kernel->refcount_decrement( $self->{sender_id}, __PACKAGE__ );
-  $kernel->post( $self->{http_id}, 'shutdown' ) unless $self->{http_alias};
   return;
 }
 
@@ -78,21 +82,7 @@ sub _start {
   }
   $kernel->refcount_increment( $sender_id, __PACKAGE__ );
   $self->{sender_id} = $sender_id;
-  if ( $self->{http_alias} ) {
-     my $http_ref = $kernel->alias_resolve( $self->{http_alias} );
-     $self->{http_id} = $http_ref->ID() if $http_ref;
-  }
-  unless ( $self->{http_id} ) {
-    $self->{http_id} = 'metacpanr' . $$ . $self->{session_id};
-    POE::Component::Client::HTTP->spawn(
-	        Alias           => $self->{http_id},
-	        FollowRedirects => 2,
-          Timeout         => 60,
-          Agent           => 'Mozilla/5.0 (X11; U; Linux i686; en-US; '
-                . 'rv:1.1) Gecko/20020913 Debian/1.1-1',
-    );
-  }
-  $self->{timestamp} = time();
+  $self->{timestamp} = 0;
   # Start requesting
   $kernel->yield('_get_recent');
   return;
@@ -101,34 +91,48 @@ sub _start {
 sub _get_recent {
   my ($kernel,$self) = @_[KERNEL,OBJECT];
   $kernel->delay('_get_recent');
-  $kernel->post(
-    $self->{http_id},
-    'request',
-    '_handle_recent',
-     HTTP::Request->new( GET => 'http://fastapi.metacpan.org/release/recent?type=l&page=1&page_size=100' ),
+  if ( $self->{shutdown} ) {
+    $kernel->yield('_real_shutdown');
+    return;
+  }
+  POE::Component::SmokeBox::Recent::HTTP->spawn(
+     uri => URI->new( 'http://fastapi.metacpan.org/release/recent?type=l&page=1&page_size=100' ),
   );
   $self->{_http_requests}++;
   return;
 }
 
 sub _handle_recent {
-  my ($kernel,$self,$req,$res) = @_[KERNEL,OBJECT,ARG0,ARG1];
+  my ($kernel,$self,$http_resp) = @_[KERNEL,OBJECT,ARG0];
   $self->{_http_requests}--;
-  my $http_resp = $res->[0];
   if ( $http_resp and $http_resp->code() == 200 ) {
     my $recents = eval { decode_json( $http_resp->content() ) };
     SWITCH: {
       last SWITCH unless $recents;
       last SWITCH unless $recents->{releases};
       last SWITCH unless ref $recents->{releases} eq 'ARRAY';
-      foreach my $recent ( @{ $recents->{releases} } ) {
+      my @uploads;
+      RELEASES: foreach my $recent ( @{ $recents->{releases} } ) {
         my $ts = Time::Piece->strptime($recent->{date},"%Y-%m-%dT%H:%M:%S")->epoch;
-        last SWITCH if $ts < $self->{timestamp};
-        $kernel->post( $self->{sender_id}, $self->{event}, $recent );
+        $self->{timestamp} = $ts unless $self->{timestamp};
+        last RELEASES if $ts <= $self->{timestamp};
+        $recent->{ts} = $ts;
+        push @uploads, $recent;
+      }
+      foreach my $upload ( reverse @uploads ) {
+        $self->{timestamp} = delete $upload->{ts};
+        $kernel->post( $self->{sender_id}, $self->{event}, $upload );
       }
     }
   }
-  $self->{timestamp} = time();
+  $kernel->yield('_real_shutdown') if $self->{shutdown};
+  $kernel->delay('_get_recent', $self->{delay}) unless $self->{shutdown};
+  return;
+}
+
+sub _get_connect_error {
+  my ($kernel,$self) = @_[KERNEL,OBJECT];
+  $self->{_http_requests}--;
   $kernel->delay('_get_recent', $self->{delay});
   return;
 }
@@ -222,7 +226,7 @@ upload
 
 L<POE>
 
-L<POE::Component::Client::HTTP>
+L<POE::Component::SmokeBox::Recent::HTTP>
 
 L<http://fastapi.metacpan.org/release/recent>
 
